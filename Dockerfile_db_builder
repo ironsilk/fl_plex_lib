@@ -7,6 +7,7 @@ RUN mkdir /app
 WORKDIR /app
 
 COPY db_builder/ .
+COPY .env ./
 
 RUN pip install -r requirements.txt
 
