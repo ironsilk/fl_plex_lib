@@ -130,6 +130,10 @@ def _get_filelist_movie(tconst):
         results = [x for x in results if x['category'] == 'Filme HD-RO' or x['category'] == 'Filme 4K Blu-Ray']
         logger.debug(f"Got {len(results)} results for tconst {tconst}")
         return results
+    elif r.status_code == 403:
+        logger.error(f"Rate limited, status code: {r.status_code}, response: {r.text}, sleeping for 5 minutes and trying again")
+        time.sleep(300)
+        return _get_filelist_movie(tconst)
     else:
         logger.error(f"Error fetching tconst {tconst} from filelist, status code: {r.status_code}, response: {r.text}")
 
@@ -259,4 +263,4 @@ def update_fl_database(engine=None, check_again=False):
 
 
 if __name__ == '__main__':
-    update_fl_database()
+    populate_imdb_database()

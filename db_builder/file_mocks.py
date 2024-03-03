@@ -7,7 +7,7 @@ load_dotenv()
 
 from db import DB_URI, FilelistMovies, ImdbMovies
 
-LIBRARY_PATH = os.getenv('PLEX_MOVIES_LIBRARY_FOLDER_MAP')
+LIBRARY_PATH = os.getenv('PLEX_MOVIES_LIBRARY_FOLDER')
 
 
 def create_symlinks(dummy_file_path, target_directory, movie_names):
