@@ -7,7 +7,7 @@ load_dotenv()
 
 from db import DB_URI, FilelistMovies, ImdbMovies
 
-LIBRARY_PATH = os.getenv('PLEX_MOVIES_LIBRARY_FOLDER')
+LIBRARY_PATH = os.getenv('PLEX_MOVIES_LIBRARY_FOLDER_MAP')
 
 
 def create_symlinks(dummy_file_path, target_directory, movie_names):
@@ -30,14 +30,14 @@ def create_symlinks(dummy_file_path, target_directory, movie_names):
         symlink_name = f"{movie_name}.mkv"
 
         # Full path for the new symlink
-        symlink_path = os.path.join(target_directory, symlink_name)
+        movie_folder = os.path.join(target_directory, movie_name)
 
         # Check if symlink already exists to avoid overwriting
-        if not os.path.exists(symlink_path):
+        if not os.path.exists(movie_folder):
             # Create the symlink inside a folder with the same name as the movie
-            movie_folder = os.path.join(target_directory, movie_name)
             os.makedirs(movie_folder, exist_ok=True)
             # create symlink
+            symlink_path = os.path.join(movie_folder, symlink_name)
             os.symlink(dummy_file_path, symlink_path)
             logger.debug(f"Created symlink for {movie_name}")
         else:

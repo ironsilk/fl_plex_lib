@@ -1,0 +1,13 @@
+version: '2.1'
+services:
+  db_builder:
+    container_name: db_builder
+    network_mode: host
+    build:
+      context: ./
+      dockerfile: Dockerfile_db_builder
+    env_file:
+      - .env
+    restart: on-failure
+    volumes:
+      - ${PLEX_MOVIES_LIBRARY_FOLDER}:{PLEX_MOVIES_LIBRARY_FOLDER_MAP}
