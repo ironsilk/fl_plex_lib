@@ -70,12 +70,13 @@ def symlink_routine():
         result = conn.execute(select(ImdbMovies.tconst, ImdbMovies.primaryTitle, ImdbMovies.startYear).where(ImdbMovies.tconst.in_(rows)))
         rows = result.fetchall()
     file_names = [f"{row[1]} ({row[2]}) {row[0]}" for row in rows]
+    tconst_s = [row[0] for row in rows]
     logger.info(f"Got {len(file_names)} movies to create symlinks for")
     dummy_file_path = _prepare_symlink_creation()
     create_symlinks(dummy_file_path, LIBRARY_PATH, file_names)
     # update db in bulk
     with engine.connect() as conn:
-        conn.execute(update(FilelistMovies).where(FilelistMovies.tconst.in_(rows)).values(file_created=True))
+        conn.execute(update(FilelistMovies).where(FilelistMovies.tconst.in_(tconst_s)).values(file_created=True))
 
 
 if __name__ == '__main__':
