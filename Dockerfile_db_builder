@@ -1,0 +1,14 @@
+# docker build -t db_builder . -f Dockerfile_db_builder
+FROM python:3.11
+
+LABEL Author="Mikael"
+
+RUN mkdir /app
+WORKDIR /app
+
+COPY db_builder/ .
+
+RUN pip install -r requirements.txt
+
+
+ENTRYPOINT ["python", "run.py"]
