@@ -10,4 +10,4 @@ services:
       - .env
     restart: on-failure
     volumes:
-      - ${PLEX_MOVIES_LIBRARY_FOLDER}:{PLEX_MOVIES_LIBRARY_FOLDER_MAP}
+      - ${PLEX_MOVIES_LIBRARY_FOLDER}:${PLEX_MOVIES_LIBRARY_FOLDER_MAP}
