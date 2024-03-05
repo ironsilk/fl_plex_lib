@@ -38,8 +38,7 @@ def create_symlinks(dummy_file_path, target_directory, movie_names):
             os.makedirs(movie_folder, exist_ok=True)
             # instead of creating a symlink just paste placeholder.mkv in the folder
             # TODO apparently plex can't be fooled with symlinks so easily
-            symlink_path = os.path.join(movie_folder, symlink_name)
-            os.system(f"cp {dummy_file_path} {symlink_path}")
+            os.system(f"cp {dummy_file_path} {movie_folder}")
             logger.debug(f"Created symlink for {movie_name}")
         else:
             logger.warning(f"Symlink already exists for {movie_name}")
