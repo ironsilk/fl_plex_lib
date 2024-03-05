@@ -3,6 +3,7 @@ import time
 from sqlalchemy import Column, Integer, BigInteger, String, DateTime, Boolean, ForeignKey, ARRAY, \
     Float, MetaData, create_engine, select, desc, delete, inspect, func, or_, UniqueConstraint, ForeignKeyConstraint, \
     update, Inspector
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import create_engine
 import os
@@ -252,7 +253,9 @@ def update_fl_database(engine=None, check_again=False):
     for idx, tconst in enumerate(rows):
         if _exists_on_fl(tconst):
             with engine.connect() as conn:
-                conn.execute(FilelistMovies.__table__.insert(), {'tconst': tconst, 'file_created': False} )
+                stmt = insert(FilelistMovies.__table__).values(tconst=tconst, file_created=False)
+                stmt = stmt.on_conflict_do_nothing(index_elements=['tconst'])
+                conn.execute(stmt)
         logger.debug(f"Seleeping for 25 seconds")
         time.sleep(24)  # sleep 25 seconds to avoid rate limiting
         with engine.connect() as conn:
