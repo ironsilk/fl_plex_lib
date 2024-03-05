@@ -130,7 +130,7 @@ def _get_filelist_movie(tconst):
         results = [x for x in results if x['category'] == 'Filme HD-RO' or x['category'] == 'Filme 4K Blu-Ray']
         logger.debug(f"Got {len(results)} results for tconst {tconst}")
         return results
-    elif r.status_code == 403:
+    elif r.status_code == 429:
         logger.error(f"Rate limited, status code: {r.status_code}, response: {r.text}, sleeping for 5 minutes and trying again")
         time.sleep(300)
         return _get_filelist_movie(tconst)
