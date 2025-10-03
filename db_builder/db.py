@@ -1,4 +1,5 @@
 import time
+from datetime import date
 
 from sqlalchemy import Column, Integer, BigInteger, String, DateTime, Boolean, ForeignKey, ARRAY, \
     Float, MetaData, create_engine, select, desc, delete, inspect, func, or_, UniqueConstraint, ForeignKeyConstraint, \
@@ -291,29 +292,42 @@ def update_fl_database(engine=None, check_again=False):
     if not _check_table_exists('fl_movies'):
         _create_tables()
 
+    # Define cutoff: always re-check titles from the last year regardless of 'checked' flag
+    year_cutoff = date.today().year - 1
+
     while True:
-        # get rows from imdb_movies
+        # Build queues: older unchecked (excluding fl_movies) and recent-year regardless of 'checked'
         with engine.connect() as conn:
             if not check_again:
-                result = conn.execute(select(ImdbMovies.tconst).where(ImdbMovies.checked == False).order_by(desc(ImdbMovies.tconst)))
+                older_sel = select(ImdbMovies.tconst).where(
+                    or_(ImdbMovies.startYear == None, ImdbMovies.startYear < year_cutoff)
+                ).where(ImdbMovies.checked == False).order_by(desc(ImdbMovies.tconst))
             else:
-                result = conn.execute(select(ImdbMovies.tconst).order_by(desc(ImdbMovies.tconst)))
-            rows = result.fetchall()
+                older_sel = select(ImdbMovies.tconst).where(
+                    or_(ImdbMovies.startYear == None, ImdbMovies.startYear < year_cutoff)
+                ).order_by(desc(ImdbMovies.tconst))
 
-        logger.info(f"Got {len(rows)} rows from imdb_movies")
-        # exclude rows already in fl_movies
+            recent_sel = select(ImdbMovies.tconst).where(
+                ImdbMovies.startYear >= year_cutoff
+            ).order_by(desc(ImdbMovies.tconst))
+
+            older_rows = conn.execute(older_sel).fetchall()
+            recent_rows = conn.execute(recent_sel).fetchall()
+
+        older_rows = [x[0] for x in older_rows]
+        recent_rows = [x[0] for x in recent_rows]
+
+        # Exclude already-known FL rows only for the older set; recent set is always re-checked
         with engine.connect() as conn:
-            result = conn.execute(select(FilelistMovies.tconst))
-            fl_rows = result.fetchall()
-
-        logger.info(f"Got {len(fl_rows)} rows from fl_movies")
-        rows = [x[0] for x in rows]
+            fl_rows = conn.execute(select(FilelistMovies.tconst)).fetchall()
         fl_rows = [x[0] for x in fl_rows]
-        rows = [x for x in rows if x not in fl_rows]
+        older_rows = [x for x in older_rows if x not in fl_rows]
 
-        logger.info(f"Processing queue: {len(rows)} rows to check")
-        if rows:
-            for idx, tconst in enumerate(rows):
+        total_queue = older_rows + recent_rows
+
+        logger.info(f"Processing queue: older={len(older_rows)}, recent={len(recent_rows)}, total={len(total_queue)}")
+        if total_queue:
+            for idx, tconst in enumerate(total_queue):
                 if _exists_on_fl(tconst):
                     with engine.connect() as conn:
                         stmt = insert(FilelistMovies.__table__).values(tconst=tconst, file_created=False)
@@ -321,11 +335,13 @@ def update_fl_database(engine=None, check_again=False):
                         conn.execute(stmt)
                 logger.debug("Sleeping for 24 seconds")
                 time.sleep(24)  # sleep 24 seconds to avoid rate limiting
+                # Mark as checked; recent items may already be checked, older are marked checked to prevent reprocessing next cycles
                 with engine.connect() as conn:
                     conn.execute(update(ImdbMovies).where(ImdbMovies.tconst == tconst).values(checked=True))
                 if idx % 100 == 0:
+                    remaining = len(total_queue) - idx
                     logger.info(f"Checked {idx} rows")
-                    logger.info(f"ETA: {len(rows) - idx} rows left, {((len(rows) - idx) * 24) / 60} minutes")
+                    logger.info(f"ETA: {remaining} rows left, {(remaining * 24) / 60} minutes")
 
             logger.info("Queue exhausted. Updating IMDB database...")
         else:
@@ -335,27 +351,37 @@ def update_fl_database(engine=None, check_again=False):
         inserted_count = update_imdb_database(engine=engine)
         logger.info(f"IMDB update inserted {inserted_count} new rows.")
 
-        # Recompute rows after IMDB update
+        # Recompute queues after IMDB update
         with engine.connect() as conn:
             if not check_again:
-                result = conn.execute(select(ImdbMovies.tconst).where(ImdbMovies.checked == False).order_by(desc(ImdbMovies.tconst)))
+                older_sel = select(ImdbMovies.tconst).where(
+                    or_(ImdbMovies.startYear == None, ImdbMovies.startYear < year_cutoff)
+                ).where(ImdbMovies.checked == False).order_by(desc(ImdbMovies.tconst))
             else:
-                result = conn.execute(select(ImdbMovies.tconst).order_by(desc(ImdbMovies.tconst)))
-            rows_after = result.fetchall()
+                older_sel = select(ImdbMovies.tconst).where(
+                    or_(ImdbMovies.startYear == None, ImdbMovies.startYear < year_cutoff)
+                ).order_by(desc(ImdbMovies.tconst))
+
+            recent_sel = select(ImdbMovies.tconst).where(
+                ImdbMovies.startYear >= year_cutoff
+            ).order_by(desc(ImdbMovies.tconst))
+
+            older_rows_after = conn.execute(older_sel).fetchall()
+            recent_rows_after = conn.execute(recent_sel).fetchall()
+
+        older_rows_after = [x[0] for x in older_rows_after]
+        recent_rows_after = [x[0] for x in recent_rows_after]
 
         with engine.connect() as conn:
-            result = conn.execute(select(FilelistMovies.tconst))
-            fl_rows_after = result.fetchall()
-
-        rows_after = [x[0] for x in rows_after]
+            fl_rows_after = conn.execute(select(FilelistMovies.tconst)).fetchall()
         fl_rows_after = [x[0] for x in fl_rows_after]
-        rows_after = [x for x in rows_after if x not in fl_rows_after]
+        older_rows_after = [x for x in older_rows_after if x not in fl_rows_after]
 
-        logger.info(f"Rows to check after IMDB update: {len(rows_after)}")
+        total_after = older_rows_after + recent_rows_after
+        logger.info(f"Rows to check after IMDB update: older={len(older_rows_after)}, recent={len(recent_rows_after)}, total={len(total_after)}")
 
-        if rows_after:
+        if total_after:
             logger.info("Found rows after IMDB update. Continuing processing cycle.")
-            # Continue loop; next iteration will process rows_after
             continue
 
         # No rows to check after update: introduce long sleep before trying to update IMDB again
@@ -366,4 +392,4 @@ def update_fl_database(engine=None, check_again=False):
 
 
 if __name__ == '__main__':
-    update_imdb_database()
+    update_fl_database()
