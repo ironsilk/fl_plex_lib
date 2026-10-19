@@ -2,7 +2,7 @@ import time
 from datetime import date
 
 from sqlalchemy import Column, Integer, BigInteger, String, DateTime, Boolean, ForeignKey, ARRAY, \
-    Float, MetaData, create_engine, select, desc, delete, inspect, func, or_, UniqueConstraint, ForeignKeyConstraint, \
+    Float, create_engine, select, desc, delete, inspect, func, or_, UniqueConstraint, ForeignKeyConstraint, \
     update, Inspector, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import declarative_base, relationship
@@ -42,10 +42,11 @@ engine = create_engine(DB_URI, echo=False, isolation_level="AUTOCOMMIT")
 # declarative base class
 Base = declarative_base()
 
-# MetaData
-META_DATA = MetaData()
-META_DATA.bind = engine
-META_DATA.reflect(bind=engine)
+# NOTE: there used to be a module-level MetaData().reflect(bind=engine) here. It connected to
+# Postgres at *import* time, so `from db import ...` raised OperationalError whenever the DB was
+# down and the process died before the scheduler ever started (this killed the container on
+# 2026-10-03). META_DATA was never used anywhere else, and MetaData.bind is a no-op on
+# SQLAlchemy 2.x, so the whole block was pure startup fragility. Keep this module import-safe.
 
 
 class FilelistMovies(Base):
@@ -112,38 +113,78 @@ def _get_imdb_db(engine):
     return df
 
 def _clean_files():
-    # clean up files
-    os.remove(IMDB_TSV_FILE)
-    os.remove('title.basics.tsv')
+    """Remove the downloaded IMDB dataset. Safe to call even if a download never happened."""
+    for path in (IMDB_TSV_FILE, 'title.basics.tsv'):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Could not remove temp file {path}: {e!r}")
+
+
+RATE_LIMIT_MAX_RETRIES = 6
+RATE_LIMIT_SLEEP = 300
 
 
 def _get_filelist_movie(tconst):
-    r = requests.get(
-        url=API_URL,
-        params={
-            'username': FL_USER,
-            'passkey': FL_PASSKEY,
-            'action': 'search-torrents',
-            'type': 'imdb',
-            'query': tconst,
-        })
-    if r.status_code == 200:
-        results = r.json()
-        results = [x for x in results if x['category'] == 'Filme HD-RO' or x['category'] == 'Filme 4K Blu-Ray']
-        logger.debug(f"Got {len(results)} results for tconst {tconst}")
-        return results
-    elif r.status_code == 429:
-        logger.error(f"Rate limited, status code: {r.status_code}, response: {r.text}, sleeping for 5 minutes and trying again")
-        time.sleep(300)
-        return _get_filelist_movie(tconst)
-    else:
-        logger.error(f"Error fetching tconst {tconst} from filelist, status code: {r.status_code}, response: {r.text}")
+    """
+    Query Filelist for a tconst.
+
+    Returns a (possibly empty) list of matching torrents on success, or None if the lookup
+    could not be completed (HTTP error, network error, rate-limit budget exhausted). The
+    None-vs-[] distinction matters: callers must not treat a failed lookup as "not found",
+    otherwise a transient 500 permanently marks the title as checked. See _exists_on_fl.
+    """
+    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            r = requests.get(
+                url=API_URL,
+                params={
+                    'username': FL_USER,
+                    'passkey': FL_PASSKEY,
+                    'action': 'search-torrents',
+                    'type': 'imdb',
+                    'query': tconst,
+                },
+                timeout=60)
+        except requests.RequestException as e:
+            logger.error(f"Network error fetching tconst {tconst} from filelist: {e!r}")
+            return None
+
+        if r.status_code == 200:
+            try:
+                results = r.json()
+            except ValueError as e:
+                logger.error(f"Non-JSON 200 response for tconst {tconst}: {e!r}, body: {r.text[:200]}")
+                return None
+            results = [x for x in results if x['category'] == 'Filme HD-RO' or x['category'] == 'Filme 4K Blu-Ray']
+            logger.debug(f"Got {len(results)} results for tconst {tconst}")
+            return results
+        elif r.status_code == 429:
+            logger.error(
+                f"Rate limited (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}), status code: {r.status_code}, "
+                f"response: {r.text}, sleeping for {RATE_LIMIT_SLEEP}s and trying again")
+            time.sleep(RATE_LIMIT_SLEEP)
+            continue
+        else:
+            logger.error(f"Error fetching tconst {tconst} from filelist, status code: {r.status_code}, response: {r.text}")
+            return None
+
+    logger.error(f"Gave up on tconst {tconst} after {RATE_LIMIT_MAX_RETRIES} rate-limited attempts")
+    return None
+
 
 def _exists_on_fl(tconst):
+    """
+    True  = present on Filelist
+    False = definitively absent (the API answered with zero matches)
+    None  = lookup failed; caller must NOT mark the title as checked
+    """
     fl_results = _get_filelist_movie(tconst)
-    if fl_results:
-        return True
-    return False
+    if fl_results is None:
+        return None
+    return bool(fl_results)
 
 def populate_imdb_database(engine=None, overwrite=False):
     """
@@ -159,7 +200,9 @@ def populate_imdb_database(engine=None, overwrite=False):
     # check if table exists and is empty
     if _check_table_exists('imdb_movies'):
         with engine.connect() as conn:
-            result = conn.execute(select([func.count()]).select_from(ImdbMovies))
+            # NOTE: select([...]) (list form) was removed in SQLAlchemy 2.0 and raises
+            # ArgumentError, which made this whole seeding function unusable.
+            result = conn.execute(select(func.count()).select_from(ImdbMovies))
             count = result.scalar()
             if count > 0 and not overwrite:
                 return
@@ -169,46 +212,47 @@ def populate_imdb_database(engine=None, overwrite=False):
     df = _get_imdb_db(engine)
 
     # insert the data into the database.
+    try:
+        for chunk in df:
+            # keep only movies
+            chunk = chunk[chunk['titleType'] == 'movie']
 
-    for chunk in df:
-        # keep only movies
-        chunk = chunk[chunk['titleType'] == 'movie']
+            # parse START_IMDB_ID numeric threshold and filter by numeric tconst value
+            start_id = START_IMDB_ID or "tt0000000"
+            try:
+                start_num = int(start_id[2:]) if str(start_id).startswith('tt') else int(str(start_id))
+            except Exception:
+                start_num = 0
 
-        # parse START_IMDB_ID numeric threshold and filter by numeric tconst value
-        start_id = START_IMDB_ID or "tt0000000"
-        try:
-            start_num = int(start_id[2:]) if str(start_id).startswith('tt') else int(str(start_id))
-        except Exception:
-            start_num = 0
+            # compute numeric tconst and filter strictly greater than start_num
+            chunk['t_num'] = pd.to_numeric(chunk['tconst'].str[2:], errors='coerce')
+            chunk = chunk[chunk['t_num'] > start_num]
+            if chunk.empty:
+                continue
 
-        # compute numeric tconst and filter strictly greater than start_num
-        chunk['t_num'] = pd.to_numeric(chunk['tconst'].str[2:], errors='coerce')
-        chunk = chunk[chunk['t_num'] > start_num]
-        if chunk.empty:
-            continue
+            # limit to the columns we need
+            chunk = chunk[['tconst', 'titleType', 'primaryTitle', 'originalTitle', 'startYear', 'endYear',
+                           'runtimeMinutes', 'genres']]
 
-        # limit to the columns we need
-        chunk = chunk[['tconst', 'titleType', 'primaryTitle', 'originalTitle', 'startYear', 'endYear', 'runtimeMinutes',
-                       'genres']]
+            # mark as unchecked to be picked up by Filelist checks
+            chunk['checked'] = False
 
-        # mark as unchecked to be picked up by Filelist checks
-        chunk['checked'] = False
+            # replace "\N" with None
+            chunk = chunk.replace(r'\N', None)
 
-        # replace "\N" with None
-        chunk = chunk.replace(r'\N', None)
+            # for column genres split the string by comma
+            chunk['genres'] = chunk['genres'].str.split(',')
 
-        # for column genres split the string by comma
-        chunk['genres'] = chunk['genres'].str.split(',')
+            # drop temporary numeric column before insert
+            try:
+                chunk = chunk.drop(columns=['t_num'])
+            except Exception:
+                pass
 
-        # drop temporary numeric column before insert
-        try:
-            chunk = chunk.drop(columns=['t_num'])
-        except Exception:
-            pass
-
-        chunk.to_sql('imdb_movies', engine, if_exists='append', index=False)
-
-    _clean_files()
+            chunk.to_sql('imdb_movies', engine, if_exists='append', index=False)
+    finally:
+        # the dataset is ~1GB uncompressed; never leave it behind on an exception
+        _clean_files()
 
 
 def update_imdb_database(engine=None):
@@ -241,46 +285,49 @@ def update_imdb_database(engine=None):
 
     inserted_count = 0
     # insert the data into the database.
-    for chunk in df:
-        # keep only movies
-        chunk = chunk[chunk['titleType'] == 'movie']
+    try:
+        for chunk in df:
+            # keep only movies
+            chunk = chunk[chunk['titleType'] == 'movie']
 
-        # compute numeric tconst values and filter strictly greater than last_num
-        chunk['t_num'] = pd.to_numeric(chunk['tconst'].str[2:], errors='coerce')
-        chunk = chunk[chunk['t_num'] > last_num]
+            # compute numeric tconst values and filter strictly greater than last_num
+            chunk['t_num'] = pd.to_numeric(chunk['tconst'].str[2:], errors='coerce')
+            chunk = chunk[chunk['t_num'] > last_num]
 
-        if chunk.empty:
-            continue
+            if chunk.empty:
+                continue
 
-        # limit to the columns we need
-        chunk = chunk[['tconst', 'titleType', 'primaryTitle', 'originalTitle', 'startYear', 'endYear', 'runtimeMinutes', 'genres']]
+            # limit to the columns we need
+            chunk = chunk[['tconst', 'titleType', 'primaryTitle', 'originalTitle', 'startYear', 'endYear',
+                           'runtimeMinutes', 'genres']]
 
-        # ensure new IMDB rows are marked as unchecked so they get picked up for Filelist checks
-        chunk['checked'] = False
+            # ensure new IMDB rows are marked as unchecked so they get picked up for Filelist checks
+            chunk['checked'] = False
 
-        # replace "\N" with None
-        chunk = chunk.replace(r'\N', None)
+            # replace "\N" with None
+            chunk = chunk.replace(r'\N', None)
 
-        # for column genres split the string by comma
-        chunk['genres'] = chunk['genres'].str.split(',')
+            # for column genres split the string by comma
+            chunk['genres'] = chunk['genres'].str.split(',')
 
-        rows_to_insert = len(chunk)
-        if rows_to_insert == 0:
-            continue
+            rows_to_insert = len(chunk)
+            if rows_to_insert == 0:
+                continue
 
-        # drop temporary numeric column before insert
-        try:
-            chunk = chunk.drop(columns=['t_num'])
-        except Exception:
-            pass
+            # drop temporary numeric column before insert
+            try:
+                chunk = chunk.drop(columns=['t_num'])
+            except Exception:
+                pass
 
-        try:
-            chunk.to_sql('imdb_movies', engine, if_exists='append', index=False)
-            inserted_count += rows_to_insert
-        except Exception as e:
-            logger.error(f"Error inserting IMDB chunk: {e}")
-
-    _clean_files()
+            try:
+                chunk.to_sql('imdb_movies', engine, if_exists='append', index=False)
+                inserted_count += rows_to_insert
+            except Exception as e:
+                logger.error(f"Error inserting IMDB chunk: {e}")
+    finally:
+        # the dataset is ~1GB uncompressed; never leave it behind on an exception
+        _clean_files()
     logger.info(f"IMDB update complete. Inserted {inserted_count} new rows since last_num={last_num}.")
     return inserted_count
 
@@ -317,30 +364,40 @@ def update_fl_database(engine=None, check_again=False):
         older_rows = [x[0] for x in older_rows]
         recent_rows = [x[0] for x in recent_rows]
 
-        # Exclude already-known FL rows only for the older set; recent set is always re-checked
+        # Exclude already-known FL rows only for the older set; recent set is always re-checked.
+        # fl_rows must be a set: as a list this is O(len(older_rows) * len(fl_rows)), which with
+        # check_again=True (~700k older rows) is billions of comparisons and hangs for hours.
         with engine.connect() as conn:
             fl_rows = conn.execute(select(FilelistMovies.tconst)).fetchall()
-        fl_rows = [x[0] for x in fl_rows]
+        fl_rows = {x[0] for x in fl_rows}
         older_rows = [x for x in older_rows if x not in fl_rows]
 
         total_queue = older_rows + recent_rows
 
         logger.info(f"Processing queue: older={len(older_rows)}, recent={len(recent_rows)}, total={len(total_queue)}")
         if total_queue:
+            failed = 0
             for idx, tconst in enumerate(total_queue):
-                if _exists_on_fl(tconst):
+                found = _exists_on_fl(tconst)
+                if found:
                     with engine.connect() as conn:
                         stmt = insert(FilelistMovies.__table__).values(tconst=tconst, file_created=False)
                         stmt = stmt.on_conflict_do_nothing(index_elements=['tconst'])
                         conn.execute(stmt)
                 logger.debug("Sleeping for 24 seconds")
                 time.sleep(24)  # sleep 24 seconds to avoid rate limiting
-                # Mark as checked; recent items may already be checked, older are marked checked to prevent reprocessing next cycles
-                with engine.connect() as conn:
-                    conn.execute(update(ImdbMovies).where(ImdbMovies.tconst == tconst).values(checked=True))
+                # Only mark as checked when the lookup actually succeeded. A failed lookup
+                # (found is None) must stay unchecked so it is retried on a later cycle --
+                # otherwise a transient API error silently excludes the title forever.
+                if found is None:
+                    failed += 1
+                    logger.warning(f"Lookup failed for {tconst}; leaving it unchecked for a later retry")
+                else:
+                    with engine.connect() as conn:
+                        conn.execute(update(ImdbMovies).where(ImdbMovies.tconst == tconst).values(checked=True))
                 if idx % 100 == 0:
                     remaining = len(total_queue) - idx
-                    logger.info(f"Checked {idx} rows")
+                    logger.info(f"Checked {idx} rows ({failed} lookup failures so far)")
                     logger.info(f"ETA: {remaining} rows left, {(remaining * 24) / 60} minutes")
 
             logger.info("Queue exhausted. Updating IMDB database...")
@@ -374,7 +431,7 @@ def update_fl_database(engine=None, check_again=False):
 
         with engine.connect() as conn:
             fl_rows_after = conn.execute(select(FilelistMovies.tconst)).fetchall()
-        fl_rows_after = [x[0] for x in fl_rows_after]
+        fl_rows_after = {x[0] for x in fl_rows_after}
         older_rows_after = [x for x in older_rows_after if x not in fl_rows_after]
 
         total_after = older_rows_after + recent_rows_after
@@ -384,7 +441,14 @@ def update_fl_database(engine=None, check_again=False):
             logger.info("Found rows after IMDB update. Continuing processing cycle.")
             continue
 
-        # No rows to check after update: introduce long sleep before trying to update IMDB again
+        # No rows to check after update: introduce long sleep before trying to update IMDB again.
+        # NOTE (measured 2026-10-18): in practice this branch is unreachable. recent_sel matches
+        # every title with startYear >= year_cutoff with no 'checked' filter and no fl_movies
+        # exclusion, which is ~25k rows and never empty, so total_after is always truthy and we
+        # always 'continue' above. The job is therefore a perpetual loop that re-checks the last
+        # two years of releases every ~7 days (25k titles x 24s). That cadence is intentional --
+        # it is how newly-uploaded torrents for recent films get picked up. Kept as a safety net
+        # in case the recent window is ever narrowed.
         logger.info("No rows to check after IMDB update. Sleeping for 24 hours before next update.")
         time.sleep(86400)  # 24 hours
         # After sleep, loop continues: the next iteration will attempt another IMDB update

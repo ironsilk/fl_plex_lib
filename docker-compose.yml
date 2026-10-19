@@ -8,6 +8,8 @@ services:
       dockerfile: Dockerfile_db_builder
     env_file:
       - .env
-    restart: on-failure
+    # unless-stopped (not on-failure): this is a long-running scheduler and on-failure does not
+    # bring it back after a clean host reboot, which is how it stayed dead for two weeks.
+    restart: unless-stopped
     volumes:
       - ${PLEX_MOVIES_LIBRARY_FOLDER}:${PLEX_MOVIES_LIBRARY_FOLDER_MAP}

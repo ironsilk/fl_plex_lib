@@ -1,7 +1,46 @@
-from apscheduler.schedulers.background import BackgroundScheduler
-from file_mocks import symlink_routine
-from db import update_fl_database
+import os
 import time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from loguru import logger
+from sqlalchemy import create_engine, text
+
+from db import DB_URI, update_fl_database
+from file_mocks import symlink_routine
+
+# How long to wait for Postgres before giving up. The container shares a host with
+# MOVIELIB_postgres and Docker gives no ordering guarantee across compose projects, so on a
+# reboot (or whenever the DB is restarted) this process can easily start first. Dying here is
+# what left the container dead for two weeks on 2026-10-03, so wait instead of exiting.
+DB_WAIT_ATTEMPTS = int(os.getenv('DB_WAIT_ATTEMPTS', '120'))
+DB_WAIT_INTERVAL = int(os.getenv('DB_WAIT_INTERVAL', '5'))
+
+
+def wait_for_db(attempts=DB_WAIT_ATTEMPTS, interval=DB_WAIT_INTERVAL):
+    """
+    Block until the database answers a trivial query. Returns True on success.
+
+    Raises RuntimeError only after the full budget is exhausted, so a genuinely
+    misconfigured DSN still surfaces as a failure instead of hanging forever.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            probe = create_engine(DB_URI, echo=False, isolation_level="AUTOCOMMIT")
+            with probe.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            probe.dispose()
+            logger.info(f"Database reachable (attempt {attempt}/{attempts})")
+            return True
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Database not reachable yet (attempt {attempt}/{attempts}): {e.__class__.__name__}; "
+                f"retrying in {interval}s")
+            time.sleep(interval)
+    raise RuntimeError(
+        f"Database still unreachable after {attempts} attempts "
+        f"({attempts * interval}s). Last error: {last_error!r}")
 
 
 def schedule_tasks(symlink_time=5, update_db_time=5):
@@ -33,4 +72,5 @@ def schedule_tasks(symlink_time=5, update_db_time=5):
 
 
 if __name__ == '__main__':
+    wait_for_db()
     schedule_tasks()
