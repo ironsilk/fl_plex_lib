@@ -1,11 +1,12 @@
 import os
 import time
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 from sqlalchemy import create_engine, text
 
-from db import DB_URI, update_fl_database
+from db import DB_URI, update_fl_database, update_ratings_database
 from file_mocks import symlink_routine
 
 # How long to wait for Postgres before giving up. The container shares a host with
@@ -58,6 +59,20 @@ def schedule_tasks(symlink_time=5, update_db_time=5):
         max_instances=1,
         coalesce=True,
         replace_existing=True
+    )
+
+    # Refresh the IMDB ratings dump weekly, and once immediately on startup (next_run_time=now)
+    # so a fresh deploy populates title_ratings without waiting a week. Runs in the scheduler's
+    # threadpool, so a download/DB hiccup is contained and never blocks the keep-alive loop.
+    scheduler.add_job(
+        update_ratings_database,
+        'interval',
+        weeks=1,
+        id='update_ratings_job',
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+        next_run_time=datetime.now()
     )
 
     scheduler.start()

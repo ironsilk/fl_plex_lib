@@ -37,6 +37,13 @@ MOVIE_4K = os.getenv('MOVIE_4K')
 IMDB_TSV_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 IMDB_TSV_FILE = "file.tar.gz"
 
+# IMDB ratings dump. Separate from title.basics so the dashboard can filter by averageRating
+# with a pure local JOIN (fl_movies x imdb_movies x title_ratings) and never hit any API per
+# title. Distinct temp filenames so a ratings refresh never collides with a title.basics run.
+RATINGS_TSV_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+RATINGS_TSV_FILE = "ratings.tar.gz"
+RATINGS_TSV_EXTRACTED = "title.ratings.tsv"
+
 engine = create_engine(DB_URI, echo=False, isolation_level="AUTOCOMMIT")
 
 # declarative base class
@@ -112,9 +119,27 @@ def _get_imdb_db(engine):
 
     return df
 
+def _get_imdb_ratings_df(engine):
+    """
+    Download https://datasets.imdbws.com/title.ratings.tsv.gz and return it as a chunked
+    pandas reader. Mirror of _get_imdb_db but for the ratings dump (tconst, averageRating,
+    numVotes). The dump is small (~1.6M rows), but we still chunk it to keep memory flat.
+    """
+    response = requests.get(RATINGS_TSV_URL)
+    with open(RATINGS_TSV_FILE, 'wb') as f:
+        f.write(response.content)
+
+    with gzip.open(RATINGS_TSV_FILE, 'rb') as f_in:
+        with open(RATINGS_TSV_EXTRACTED, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    df = pd.read_csv(RATINGS_TSV_EXTRACTED, sep='\t', chunksize=100_000)
+    return df
+
+
 def _clean_files():
-    """Remove the downloaded IMDB dataset. Safe to call even if a download never happened."""
-    for path in (IMDB_TSV_FILE, 'title.basics.tsv'):
+    """Remove the downloaded IMDB datasets. Safe to call even if a download never happened."""
+    for path in (IMDB_TSV_FILE, 'title.basics.tsv', RATINGS_TSV_FILE, RATINGS_TSV_EXTRACTED):
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -330,6 +355,61 @@ def update_imdb_database(engine=None):
         _clean_files()
     logger.info(f"IMDB update complete. Inserted {inserted_count} new rows since last_num={last_num}.")
     return inserted_count
+
+
+def update_ratings_database(engine=None):
+    """
+    Load/refresh the IMDB ratings dump into the existing `title_ratings` table.
+
+    `title_ratings` already exists in movielib with schema (tconst INTEGER PK, "averageRating"
+    double, "numVotes" int) but ships empty. The IMDB dump keys titles as 'tt0133093' while this
+    table (and tmdb_data/omdb_data) use the stripped integer form 133093, so we strip the 'tt'
+    here. This lets the dashboard resolve a rating for any title via a local JOIN:
+        title_ratings.tconst = CAST(substring(fl_movies.tconst from 3) AS integer)
+    with zero per-title API calls. TRUNCATE + reload keeps the weekly refresh idempotent; the
+    dump is small enough (~1.6M rows) that a full reload is cheaper than diffing.
+
+    Returns:
+        int: number of rating rows loaded.
+    """
+    engine = engine or create_engine(DB_URI, echo=False, isolation_level="AUTOCOMMIT")
+
+    if not _check_table_exists('title_ratings'):
+        # The table is provisioned alongside the rest of the movielib schema; if it is somehow
+        # missing we bail loudly rather than guessing a schema that must match tmdb_data's int id.
+        logger.error("title_ratings table does not exist; cannot load ratings dump.")
+        return 0
+
+    df = _get_imdb_ratings_df(engine)
+
+    loaded = 0
+    try:
+        # Fresh load: clear the table once, up front, then append every chunk.
+        with engine.connect() as conn:
+            conn.execute(text("TRUNCATE TABLE title_ratings"))
+
+        for chunk in df:
+            # strip the 'tt' prefix -> integer tconst to match the table / tmdb_data / omdb_data
+            chunk['tconst'] = pd.to_numeric(chunk['tconst'].str[2:], errors='coerce')
+            chunk = chunk.dropna(subset=['tconst'])
+            chunk['tconst'] = chunk['tconst'].astype(int)
+
+            # keep exactly the table's columns (names must match the quoted camelCase columns)
+            chunk = chunk[['tconst', 'averageRating', 'numVotes']]
+
+            rows = len(chunk)
+            if rows == 0:
+                continue
+
+            # method='multi' batches the INSERT; 3 cols * 10k rows is well under PG's param cap
+            chunk.to_sql('title_ratings', engine, if_exists='append', index=False,
+                         method='multi', chunksize=10_000)
+            loaded += rows
+    finally:
+        _clean_files()
+
+    logger.info(f"Ratings load complete. Loaded {loaded} rows into title_ratings.")
+    return loaded
 
 
 def update_fl_database(engine=None, check_again=False):
